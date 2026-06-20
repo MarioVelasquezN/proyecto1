@@ -1,11 +1,8 @@
+// InventoryModule replaced by StockModule (src/stock/stock.module.ts).
+// This stub is kept so any stale import still compiles.
+// AppModule now imports StockModule directly.
 import { Module } from '@nestjs/common';
-import { InventoryController } from './inventory.controller';
-import { InventoryService } from './inventory.service';
-import { AuthModule } from '../auth/auth.module';
+import { StockModule } from '../stock/stock.module';
 
-@Module({
-  imports: [AuthModule],
-  controllers: [InventoryController],
-  providers: [InventoryService],
-})
+@Module({ imports: [StockModule] })
 export class InventoryModule {}

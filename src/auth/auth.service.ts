@@ -9,6 +9,7 @@ import { CreateUserDto } from '../users/dto/create-user.dto';
 import { LoginDto } from './dto/login.dto';
 import { JwtPayload } from './interfaces/jwt-payload.interface';
 import { Role } from './enums/role.enum';
+import { mapPrismaRole } from './helpers/map-prisma-role';
 
 // 64 random bytes → 128-char hex string, unguessable
 const REFRESH_TOKEN_BYTES = 64;
@@ -39,7 +40,7 @@ export class AuthService {
     }
 
     const { password: _, ...safeUser } = user;
-    const accessToken = this.signAccessToken({ sub: safeUser.id, email: safeUser.email, role: safeUser.role });
+    const accessToken = this.signAccessToken({ sub: safeUser.id, email: safeUser.email, role: mapPrismaRole(safeUser.role) });
     const refreshToken = await this.persistRefreshToken(safeUser.id);
     return { accessToken, refreshToken, user: safeUser };
   }
@@ -78,7 +79,7 @@ export class AuthService {
     const accessToken = this.signAccessToken({
       sub: stored.user.id,
       email: stored.user.email,
-      role: stored.user.role,
+      role: mapPrismaRole(stored.user.role),
     });
 
     return { accessToken, refreshToken: newRefreshToken };

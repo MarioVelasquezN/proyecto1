@@ -1,6 +1,6 @@
 import { PositiveInt } from '../../common/dto/numeric-field.decorators';
 
-export class CreateOrderItemDto {
+export class DecreaseStockDto {
   @PositiveInt('productId')
   productId: number;
 

@@ -1,34 +1,34 @@
 import {
+  IsDefined,
   IsString,
-  IsNumber,
-  IsInt,
   IsOptional,
-  IsPositive,
   MinLength,
   MaxLength,
-  Min,
 } from 'class-validator';
+import {
+  NonNegativeInt,
+  PositiveInt,
+  PositiveNumber,
+} from '../../common/dto/numeric-field.decorators';
 
 export class CreateProductDto {
-  @IsString()
-  @MinLength(1)
-  @MaxLength(200)
+  @IsDefined({ message: 'name is required' })
+  @IsString({ message: 'name must be a string' })
+  @MinLength(1, { message: 'name must not be empty' })
+  @MaxLength(200, { message: 'name must not exceed 200 characters' })
   name: string;
 
-  @IsString()
+  @IsString({ message: 'description must be a string' })
   @IsOptional()
-  @MaxLength(1000)
+  @MaxLength(1000, { message: 'description must not exceed 1000 characters' })
   description?: string;
 
-  @IsNumber()
-  @Min(0)
+  @PositiveNumber('price')
   price: number;
 
-  @IsInt()
-  @Min(0)
+  @NonNegativeInt('stock')
   stock: number;
 
-  @IsInt()
-  @IsPositive()
+  @PositiveInt('categoryId')
   categoryId: number;
 }

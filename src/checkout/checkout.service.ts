@@ -5,50 +5,28 @@ import {
   UnprocessableEntityException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { CartService } from '../cart/cart.service';
+import { StockService } from '../stock/stock.service';
+import { OrdersService } from '../orders/orders.service';
 import { CheckoutDto } from './dto/checkout.dto';
-
-const CHECKOUT_ORDER_SELECT = {
-  id: true,
-  userId: true,
-  total: true,
-  status: true,
-  createdAt: true,
-  coupon: { select: { id: true, code: true, percentage: true } },
-  items: {
-    select: {
-      id: true,
-      productId: true,
-      quantity: true,
-      price: true,
-      product: { select: { id: true, name: true } },
-    },
-  },
-} as const;
 
 @Injectable()
 export class CheckoutService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly cartService: CartService,
+    private readonly stockService: StockService,
+    private readonly ordersService: OrdersService,
+  ) {}
 
   async checkout(userId: number, dto: CheckoutDto = {}) {
-    const cart = await this.prisma.cart.findUnique({
-      where: { userId },
-      select: {
-        id: true,
-        items: {
-          select: {
-            productId: true,
-            quantity: true,
-            product: { select: { id: true, price: true, stock: true } },
-          },
-        },
-      },
-    });
+    const cart = await this.cartService.getForCheckout(userId);
 
     if (!cart || cart.items.length === 0) {
       throw new UnprocessableEntityException('Cart is empty');
     }
 
-    // Pre-check stock for descriptive error messages before touching any data.
+    // Pre-check stock outside the transaction for descriptive error messages.
     for (const item of cart.items) {
       if (item.product.stock < item.quantity) {
         throw new ConflictException(
@@ -73,37 +51,24 @@ export class CheckoutService {
       : subtotal;
 
     return this.prisma.$transaction(async (tx) => {
-      // Atomic guard — second layer against TOCTOU race conditions.
-      for (const item of cart.items) {
-        const updated = await tx.product.updateMany({
-          where: { id: item.productId, stock: { gte: item.quantity } },
-          data: { stock: { decrement: item.quantity } },
-        });
+      await this.stockService.decreaseMany(
+        cart.items.map(({ productId, quantity }) => ({ productId, quantity })),
+        tx,
+      );
 
-        if (updated.count === 0) {
-          throw new ConflictException(
-            `Insufficient stock for product ${item.productId} (concurrent update)`,
-          );
-        }
-      }
+      const order = await this.ordersService.persist(
+        tx,
+        userId,
+        cart.items.map((item) => ({
+          productId: item.productId,
+          quantity: item.quantity,
+          price: item.product.price,
+        })),
+        total,
+        coupon?.id,
+      );
 
-      const order = await tx.order.create({
-        data: {
-          userId,
-          total,
-          ...(coupon && { couponId: coupon.id }),
-          items: {
-            create: cart.items.map((item) => ({
-              productId: item.productId,
-              quantity: item.quantity,
-              price: item.product.price,
-            })),
-          },
-        },
-        select: CHECKOUT_ORDER_SELECT,
-      });
-
-      await tx.cartItem.deleteMany({ where: { cartId: cart.id } });
+      await this.cartService.clear(cart.id, tx);
 
       return order;
     });

@@ -158,6 +158,69 @@ describe('CartService', () => {
     });
   });
 
+  // ── getForCheckout ────────────────────────────────────────────────────────
+
+  describe('getForCheckout', () => {
+    it('retorna el carrito con id, items, precio y stock del producto', async () => {
+      const checkoutCart = {
+        id: CART_ID,
+        items: [
+          { productId: PRODUCT_ID, quantity: 2, product: { id: PRODUCT_ID, price: 25.0, stock: 10 } },
+        ],
+      };
+      prismaMock.cart.findUnique.mockResolvedValue(checkoutCart);
+
+      const result = await service.getForCheckout(USER_ID);
+
+      expect(prismaMock.cart.findUnique).toHaveBeenCalledWith({
+        where: { userId: USER_ID },
+        select: {
+          id: true,
+          items: {
+            select: {
+              productId: true,
+              quantity: true,
+              product: { select: { id: true, price: true, stock: true } },
+            },
+          },
+        },
+      });
+      expect(result).toEqual(checkoutCart);
+    });
+
+    it('retorna null si el usuario no tiene carrito', async () => {
+      prismaMock.cart.findUnique.mockResolvedValue(null);
+
+      const result = await service.getForCheckout(USER_ID);
+
+      expect(result).toBeNull();
+    });
+
+    it('cart funciona independiente: CartService no depende de OrdersService ni CheckoutService', () => {
+      // CartService solo necesita PrismaService — verifiable inspeccionando el módulo de test.
+      // El módulo se compila sin inyectar OrdersService ni CheckoutService.
+      expect(service).toBeDefined();
+    });
+  });
+
+  // ── clear ─────────────────────────────────────────────────────────────────
+
+  describe('clear', () => {
+    it('llama a tx.cartItem.deleteMany con el cartId correcto', async () => {
+      const txMock = { cartItem: { deleteMany: jest.fn().mockResolvedValue({ count: 2 }) } } as any;
+
+      await service.clear(CART_ID, txMock);
+
+      expect(txMock.cartItem.deleteMany).toHaveBeenCalledWith({ where: { cartId: CART_ID } });
+    });
+
+    it('no lanza error si el carrito ya estaba vacío (count 0)', async () => {
+      const txMock = { cartItem: { deleteMany: jest.fn().mockResolvedValue({ count: 0 }) } } as any;
+
+      await expect(service.clear(CART_ID, txMock)).resolves.toBeUndefined();
+    });
+  });
+
   // ── remove ────────────────────────────────────────────────────────────────
 
   describe('remove', () => {

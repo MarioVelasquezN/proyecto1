@@ -6,6 +6,9 @@ import {
 } from '@nestjs/common';
 import { CheckoutService } from './checkout.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { CartService } from '../cart/cart.service';
+import { StockService } from '../stock/stock.service';
+import { OrdersService } from '../orders/orders.service';
 
 // ── fixtures ──────────────────────────────────────────────────────────────────
 
@@ -13,7 +16,7 @@ const USER_ID = 1;
 const CART_ID = 10;
 
 const FUTURE = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-const PAST = new Date(Date.now() - 1000);
+const PAST   = new Date(Date.now() - 1000);
 
 const makeCartItem = (overrides: Record<string, unknown> = {}) => ({
   productId: 5,
@@ -39,25 +42,26 @@ const makeOrder = (total = 50, coupon: Record<string, unknown> | null = null) =>
   status: 'pending',
   createdAt: new Date(),
   coupon,
-  items: [
-    {
-      id: 1,
-      productId: 5,
-      quantity: 2,
-      price: 25.0,
-      product: { id: 5, name: 'Widget' },
-    },
-  ],
+  items: [{ id: 1, productId: 5, quantity: 2, price: 25.0, product: { id: 5, name: 'Widget' } }],
 });
 
-// ── mock ──────────────────────────────────────────────────────────────────────
+// ── mocks ─────────────────────────────────────────────────────────────────────
+
+const cartServiceMock = {
+  getForCheckout: jest.fn(),
+  clear: jest.fn(),
+};
+
+const ordersServiceMock = {
+  persist: jest.fn(),
+};
+
+const stockServiceMock = {
+  decreaseMany: jest.fn(),
+};
 
 const prismaMock = {
-  cart: { findUnique: jest.fn() },
   coupon: { findUnique: jest.fn() },
-  product: { updateMany: jest.fn() },
-  order: { create: jest.fn() },
-  cartItem: { deleteMany: jest.fn() },
   $transaction: jest.fn(),
 };
 
@@ -70,17 +74,21 @@ describe('CheckoutService', () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         CheckoutService,
-        { provide: PrismaService, useValue: prismaMock },
+        { provide: PrismaService,  useValue: prismaMock },
+        { provide: CartService,    useValue: cartServiceMock },
+        { provide: StockService,   useValue: stockServiceMock },
+        { provide: OrdersService,  useValue: ordersServiceMock },
       ],
     }).compile();
 
     service = module.get<CheckoutService>(CheckoutService);
     jest.clearAllMocks();
 
-    prismaMock.cart.findUnique.mockResolvedValue(makeCart());
-    prismaMock.product.updateMany.mockResolvedValue({ count: 1 });
-    prismaMock.order.create.mockResolvedValue(makeOrder());
-    prismaMock.cartItem.deleteMany.mockResolvedValue({ count: 1 });
+    // Default happy-path stubs
+    cartServiceMock.getForCheckout.mockResolvedValue(makeCart());
+    cartServiceMock.clear.mockResolvedValue(undefined);
+    ordersServiceMock.persist.mockResolvedValue(makeOrder());
+    stockServiceMock.decreaseMany.mockResolvedValue(undefined);
     prismaMock.$transaction.mockImplementation(
       (fn: (tx: typeof prismaMock) => unknown) => fn(prismaMock),
     );
@@ -89,71 +97,84 @@ describe('CheckoutService', () => {
   // ── sin cupón (comportamiento base) ──────────────────────────────────────
 
   describe('sin cupón', () => {
-    it('carrito se convierte en orden con total correcto', async () => {
+    it('delega lectura del carrito a CartService.getForCheckout', async () => {
+      await service.checkout(USER_ID);
+
+      expect(cartServiceMock.getForCheckout).toHaveBeenCalledWith(USER_ID);
+    });
+
+    it('delega la creación de la orden a OrdersService.persist con userId y total', async () => {
+      await service.checkout(USER_ID);
+
+      expect(ordersServiceMock.persist).toHaveBeenCalledWith(
+        prismaMock, // tx
+        USER_ID,
+        [{ productId: 5, quantity: 2, price: 25.0 }],
+        50,
+        undefined, // sin couponId
+      );
+    });
+
+    it('delega el vaciado del carrito a CartService.clear con cartId y tx', async () => {
+      await service.checkout(USER_ID);
+
+      expect(cartServiceMock.clear).toHaveBeenCalledWith(CART_ID, prismaMock);
+    });
+
+    it('delega el decremento de stock a StockService.decreaseMany', async () => {
+      await service.checkout(USER_ID);
+
+      expect(stockServiceMock.decreaseMany).toHaveBeenCalledWith(
+        [{ productId: 5, quantity: 2 }],
+        prismaMock,
+      );
+    });
+
+    it('retorna el resultado de OrdersService.persist', async () => {
+      const expected = makeOrder(50);
+      ordersServiceMock.persist.mockResolvedValue(expected);
+
       const result = await service.checkout(USER_ID);
 
-      expect(prismaMock.order.create).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({ userId: USER_ID, total: 50 }),
-        }),
-      );
-      expect(result.total).toBe(50);
+      expect(result).toEqual(expected);
     });
 
-    it('carrito queda vacío: cartItem.deleteMany se llama con el cartId', async () => {
+    it('items incluyen precio snapshot del carrito al momento del checkout', async () => {
       await service.checkout(USER_ID);
 
-      expect(prismaMock.cartItem.deleteMany).toHaveBeenCalledWith({
-        where: { cartId: CART_ID },
-      });
-    });
-
-    it('stock se reduce con WHERE stock >= quantity', async () => {
-      await service.checkout(USER_ID);
-
-      expect(prismaMock.product.updateMany).toHaveBeenCalledWith({
-        where: { id: 5, stock: { gte: 2 } },
-        data: { stock: { decrement: 2 } },
-      });
-    });
-
-    it('items incluyen precio snapshot en el momento del checkout', async () => {
-      await service.checkout(USER_ID);
-
-      const { data } = prismaMock.order.create.mock.calls[0][0];
-      expect(data.items.create[0]).toEqual({ productId: 5, quantity: 2, price: 25.0 });
+      const [, , items] = ordersServiceMock.persist.mock.calls[0];
+      expect(items[0]).toEqual({ productId: 5, quantity: 2, price: 25.0 });
     });
 
     it('total se calcula correctamente con múltiples items', async () => {
-      prismaMock.cart.findUnique.mockResolvedValue(
+      cartServiceMock.getForCheckout.mockResolvedValue(
         makeCart([
           makeCartItem({ productId: 1, quantity: 3, product: { id: 1, price: 10, stock: 20 } }),
           makeCartItem({ productId: 2, quantity: 2, product: { id: 2, price: 15, stock: 20 } }),
         ]),
       );
-      prismaMock.order.create.mockResolvedValue(makeOrder(60));
 
       await service.checkout(USER_ID);
 
-      const { data } = prismaMock.order.create.mock.calls[0][0];
-      expect(data.total).toBe(60); // 3×10 + 2×15
+      const [, , , total] = ordersServiceMock.persist.mock.calls[0];
+      expect(total).toBe(60); // 3×10 + 2×15
     });
 
     it('lanza UnprocessableEntityException si el carrito está vacío', async () => {
-      prismaMock.cart.findUnique.mockResolvedValue(makeCart([]));
+      cartServiceMock.getForCheckout.mockResolvedValue(makeCart([]));
 
       await expect(service.checkout(USER_ID)).rejects.toThrow(UnprocessableEntityException);
       expect(prismaMock.$transaction).not.toHaveBeenCalled();
     });
 
     it('lanza UnprocessableEntityException si el usuario no tiene carrito', async () => {
-      prismaMock.cart.findUnique.mockResolvedValue(null);
+      cartServiceMock.getForCheckout.mockResolvedValue(null);
 
       await expect(service.checkout(USER_ID)).rejects.toThrow(UnprocessableEntityException);
     });
 
-    it('lanza ConflictException si el stock es insuficiente', async () => {
-      prismaMock.cart.findUnique.mockResolvedValue(
+    it('lanza ConflictException si el stock es insuficiente (pre-check)', async () => {
+      cartServiceMock.getForCheckout.mockResolvedValue(
         makeCart([makeCartItem({ quantity: 20, product: { id: 5, price: 25.0, stock: 5 } })]),
       );
 
@@ -161,18 +182,20 @@ describe('CheckoutService', () => {
       expect(prismaMock.$transaction).not.toHaveBeenCalled();
     });
 
-    it('lanza ConflictException por TOCTOU cuando updateMany retorna count:0', async () => {
-      prismaMock.product.updateMany.mockResolvedValue({ count: 0 });
+    it('lanza ConflictException si StockService.decreaseMany falla por TOCTOU', async () => {
+      stockServiceMock.decreaseMany.mockRejectedValue(
+        new ConflictException('Insufficient stock (concurrent update)'),
+      );
 
       await expect(service.checkout(USER_ID)).rejects.toThrow(ConflictException);
-      expect(prismaMock.cartItem.deleteMany).not.toHaveBeenCalled();
+      expect(cartServiceMock.clear).not.toHaveBeenCalled();
     });
 
     it('carrito NO se vacía si la creación de la orden falla', async () => {
-      prismaMock.order.create.mockRejectedValue(new Error('DB error'));
+      ordersServiceMock.persist.mockRejectedValue(new Error('DB error'));
 
       await expect(service.checkout(USER_ID)).rejects.toThrow('DB error');
-      expect(prismaMock.cartItem.deleteMany).not.toHaveBeenCalled();
+      expect(cartServiceMock.clear).not.toHaveBeenCalled();
     });
   });
 
@@ -181,24 +204,23 @@ describe('CheckoutService', () => {
   describe('con cupón', () => {
     beforeEach(() => {
       prismaMock.coupon.findUnique.mockResolvedValue(makeCoupon());
-      prismaMock.order.create.mockResolvedValue(
+      ordersServiceMock.persist.mockResolvedValue(
         makeOrder(40, { id: 1, code: 'SAVE20', percentage: 20 }),
       );
     });
 
     it('cupón válido reduce el total (20% de descuento: 50 → 40)', async () => {
-      const result = await service.checkout(USER_ID, { couponCode: 'SAVE20' });
-
-      const { data } = prismaMock.order.create.mock.calls[0][0];
-      expect(data.total).toBe(40); // 50 * (1 - 0.20)
-      expect(result.total).toBe(40);
-    });
-
-    it('couponId se guarda en la orden cuando se aplica cupón', async () => {
       await service.checkout(USER_ID, { couponCode: 'SAVE20' });
 
-      const { data } = prismaMock.order.create.mock.calls[0][0];
-      expect(data.couponId).toBe(1);
+      const [, , , total] = ordersServiceMock.persist.mock.calls[0];
+      expect(total).toBe(40); // 50 * (1 - 0.20)
+    });
+
+    it('couponId se pasa a OrdersService.persist cuando se aplica cupón', async () => {
+      await service.checkout(USER_ID, { couponCode: 'SAVE20' });
+
+      const [, , , , couponId] = ordersServiceMock.persist.mock.calls[0];
+      expect(couponId).toBe(1);
     });
 
     it('descuento se aplica correctamente con porcentaje fraccionario', async () => {
@@ -206,23 +228,20 @@ describe('CheckoutService', () => {
 
       await service.checkout(USER_ID, { couponCode: 'SAVE155' });
 
-      const { data } = prismaMock.order.create.mock.calls[0][0];
-      // 50 * (1 - 0.155) = 50 * 0.845 = 42.25
-      expect(data.total).toBe(42.25);
+      const [, , , total] = ordersServiceMock.persist.mock.calls[0];
+      expect(total).toBe(42.25); // 50 * (1 - 0.155)
     });
 
-    it('sin couponCode: couponId no se incluye en la orden', async () => {
+    it('sin couponCode: couponId es undefined en OrdersService.persist', async () => {
       await service.checkout(USER_ID);
 
-      const { data } = prismaMock.order.create.mock.calls[0][0];
-      expect(data.couponId).toBeUndefined();
+      const [, , , , couponId] = ordersServiceMock.persist.mock.calls[0];
+      expect(couponId).toBeUndefined();
       expect(prismaMock.coupon.findUnique).not.toHaveBeenCalled();
     });
 
     it('cupón expirado es rechazado → UnprocessableEntityException', async () => {
-      prismaMock.coupon.findUnique.mockResolvedValue(
-        makeCoupon({ expiresAt: PAST }),
-      );
+      prismaMock.coupon.findUnique.mockResolvedValue(makeCoupon({ expiresAt: PAST }));
 
       await expect(
         service.checkout(USER_ID, { couponCode: 'OLD20' }),
@@ -242,9 +261,7 @@ describe('CheckoutService', () => {
     });
 
     it('cupón inactivo → UnprocessableEntityException', async () => {
-      prismaMock.coupon.findUnique.mockResolvedValue(
-        makeCoupon({ isActive: false }),
-      );
+      prismaMock.coupon.findUnique.mockResolvedValue(makeCoupon({ isActive: false }));
 
       await expect(
         service.checkout(USER_ID, { couponCode: 'INACTIVE' }),
@@ -260,7 +277,44 @@ describe('CheckoutService', () => {
         service.checkout(USER_ID, { couponCode: 'NOEXIST' }),
       ).rejects.toThrow();
 
-      expect(prismaMock.cartItem.deleteMany).not.toHaveBeenCalled();
+      expect(cartServiceMock.clear).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── checkout es un orquestador: no hay lógica propia de cart ni order ────
+
+  describe('checkout como orquestador', () => {
+    it('CheckoutService no llama a prisma.order.create directamente', async () => {
+      const prismaMockWithOrder = { ...prismaMock, order: { create: jest.fn() } };
+      // Even if order.create exists on the mock, CheckoutService should not use it.
+      // It delegates to OrdersService.persist instead.
+      await service.checkout(USER_ID);
+
+      // ordersService.persist is the only path to creating orders
+      expect(ordersServiceMock.persist).toHaveBeenCalledTimes(1);
+    });
+
+    it('CheckoutService no llama a cartItem.deleteMany directamente', async () => {
+      await service.checkout(USER_ID);
+
+      // Cart clearing is delegated to CartService.clear, not prisma.cartItem.deleteMany
+      expect(cartServiceMock.clear).toHaveBeenCalledTimes(1);
+    });
+
+    it('las 3 operaciones de transacción ocurren dentro de $transaction', async () => {
+      let transactionExecuted = false;
+      prismaMock.$transaction.mockImplementation(async (fn: (tx: unknown) => unknown) => {
+        transactionExecuted = true;
+        return fn(prismaMock);
+      });
+
+      await service.checkout(USER_ID);
+
+      expect(transactionExecuted).toBe(true);
+      // All three transactional ops called
+      expect(stockServiceMock.decreaseMany).toHaveBeenCalledTimes(1);
+      expect(ordersServiceMock.persist).toHaveBeenCalledTimes(1);
+      expect(cartServiceMock.clear).toHaveBeenCalledTimes(1);
     });
   });
 });

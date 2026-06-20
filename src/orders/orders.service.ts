@@ -2,25 +2,16 @@ import {
   Injectable,
   NotFoundException,
   ConflictException,
-  UnprocessableEntityException,
 } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { StockService } from '../stock/stock.service';
 import { JwtPayload } from '../auth/interfaces/jwt-payload.interface';
 import { Role } from '../auth/enums/role.enum';
 import { CreateOrderDto } from './dto/create-order.dto';
 import { UpdateOrderStatusDto } from './dto/update-order-status.dto';
 import { OrderStatus } from './enums/order-status.enum';
-
-// Valid state-machine transitions. Anything not listed here is forbidden.
-//   pending  → paid | cancelled
-//   paid     → delivered
-//   cancelled / delivered are terminal — no further transitions allowed.
-const ALLOWED_TRANSITIONS: Readonly<Record<OrderStatus, readonly OrderStatus[]>> = {
-  [OrderStatus.Pending]: [OrderStatus.Paid, OrderStatus.Cancelled],
-  [OrderStatus.Paid]: [OrderStatus.Delivered],
-  [OrderStatus.Cancelled]: [],
-  [OrderStatus.Delivered]: [],
-};
+import { OrderStateMachine } from './order-state-machine';
 
 const ORDER_SELECT = {
   id: true,
@@ -39,9 +30,18 @@ const ORDER_SELECT = {
   },
 } as const;
 
+// Extended select used by the checkout path — includes applied coupon.
+const ORDER_FULL_SELECT = {
+  ...ORDER_SELECT,
+  coupon: { select: { id: true, code: true, percentage: true } },
+} as const;
+
 @Injectable()
 export class OrdersService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly stockService: StockService,
+  ) {}
 
   async create(dto: CreateOrderDto, userId: number) {
     return this.prisma.$transaction(async (tx) => {
@@ -78,22 +78,10 @@ export class OrdersService {
         0,
       );
 
-      // Decrement each product's stock atomically.
-      // The WHERE stock >= quantity guard is a second safety net against the
-      // TOCTOU race condition: if a concurrent transaction consumed units
-      // between the read above and this update, count will be 0 and we abort.
-      for (const item of dto.items) {
-        const updated = await tx.product.updateMany({
-          where: { id: item.productId, stock: { gte: item.quantity } },
-          data: { stock: { decrement: item.quantity } },
-        });
-
-        if (updated.count === 0) {
-          throw new ConflictException(
-            `Insufficient stock for product ${item.productId} (concurrent update)`,
-          );
-        }
-      }
+      // Atomic stock decrement via StockService (TOCTOU guard included).
+      // If a concurrent transaction consumed stock between the findMany above
+      // and this call, StockService will throw ConflictException and roll back.
+      await this.stockService.decreaseMany(dto.items, tx);
 
       return tx.order.create({
         data: {
@@ -141,6 +129,24 @@ export class OrdersService {
     return order;
   }
 
+  async persist(
+    tx: Prisma.TransactionClient,
+    userId: number,
+    items: Array<{ productId: number; quantity: number; price: number }>,
+    total: number,
+    couponId?: number,
+  ) {
+    return tx.order.create({
+      data: {
+        userId,
+        total,
+        ...(couponId !== undefined && { couponId }),
+        items: { create: items },
+      },
+      select: ORDER_FULL_SELECT,
+    });
+  }
+
   async updateStatus(id: number, dto: UpdateOrderStatusDto) {
     const order = await this.prisma.order.findUnique({
       where: { id },
@@ -153,14 +159,8 @@ export class OrdersService {
 
     const from = order.status as OrderStatus;
     const to = dto.status;
-    const allowed = ALLOWED_TRANSITIONS[from] ?? [];
 
-    if (!allowed.includes(to)) {
-      throw new UnprocessableEntityException(
-        `Invalid transition: '${from}' → '${to}'. ` +
-          `Allowed from '${from}': ${allowed.length ? allowed.join(', ') : 'none (terminal state)'}`,
-      );
-    }
+    OrderStateMachine.transition(from, to);
 
     return this.prisma.order.update({
       where: { id },

@@ -52,7 +52,7 @@ export class AuditInterceptor implements NestInterceptor {
 
     const timestamp = new Date();
     const userId =
-      (request.user as JwtPayload | undefined)?.sub?.toString() ?? 'anonymous';
+      ((request as Request & { user?: JwtPayload }).user)?.sub?.toString() ?? 'anonymous';
     const method = request.method;
     const endpoint = request.originalUrl;
     const body = sanitizeBody(request.body);

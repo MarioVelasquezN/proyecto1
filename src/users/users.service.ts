@@ -3,6 +3,7 @@ import * as bcrypt from 'bcrypt';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UserResponseDto } from './dto/user-response.dto';
+import { mapPrismaRole } from '../auth/helpers/map-prisma-role';
 
 const SALT_ROUNDS = 10;
 
@@ -25,7 +26,7 @@ export class UsersService {
           name: dto.name,
         },
       });
-      return user;
+      return { ...user, role: mapPrismaRole(user.role) };
     } catch (error: any) {
       // P2002 = Prisma unique constraint violation
       if (error?.code === 'P2002') {

@@ -4,6 +4,8 @@ import { validate } from 'class-validator';
 import { plainToInstance } from 'class-transformer';
 import { OrdersService } from './orders.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { StockService } from '../stock/stock.service';
+import { OrderStateMachine } from './order-state-machine';
 import { Role } from '../auth/enums/role.enum';
 import { OrderStatus } from './enums/order-status.enum';
 import { CreateOrderDto } from './dto/create-order.dto';
@@ -11,6 +13,12 @@ import { UpdateOrderStatusDto } from './dto/update-order-status.dto';
 import { JwtPayload } from '../auth/interfaces/jwt-payload.interface';
 
 // ── mocks ─────────────────────────────────────────────────────────────────────
+
+// Stock operations are now delegated to StockService.
+// OrdersService no longer calls product.updateMany directly.
+const stockServiceMock = {
+  decreaseMany: jest.fn(),
+};
 
 const prismaMock = {
   $transaction: jest.fn(),
@@ -22,7 +30,6 @@ const prismaMock = {
   },
   product: {
     findMany: jest.fn(),
-    updateMany: jest.fn(),
   },
 };
 
@@ -72,6 +79,7 @@ describe('OrdersService', () => {
       providers: [
         OrdersService,
         { provide: PrismaService, useValue: prismaMock },
+        { provide: StockService, useValue: stockServiceMock },
       ],
     }).compile();
 
@@ -82,8 +90,8 @@ describe('OrdersService', () => {
     prismaMock.$transaction.mockImplementation(
       (cb: (tx: typeof prismaMock) => unknown) => cb(prismaMock),
     );
-    // Default: every stock update succeeds (count=1)
-    prismaMock.product.updateMany.mockResolvedValue({ count: 1 });
+    // Default: StockService.decreaseMany succeeds
+    stockServiceMock.decreaseMany.mockResolvedValue(undefined);
   });
 
   // ── create ────────────────────────────────────────────────────────────────
@@ -221,8 +229,8 @@ describe('OrdersService', () => {
         ),
       ).rejects.toThrow(ConflictException);
 
-      // No stock was decremented because validation failed first
-      expect(prismaMock.product.updateMany).not.toHaveBeenCalled();
+      // Validation failed before reaching StockService — no decrement attempted
+      expect(stockServiceMock.decreaseMany).not.toHaveBeenCalled();
     });
 
     it('no se crea la orden si hay stock insuficiente', async () => {
@@ -235,17 +243,19 @@ describe('OrdersService', () => {
       expect(prismaMock.order.create).not.toHaveBeenCalled();
     });
 
-    it('falla si stock se agota por carrera concurrente (updateMany devuelve count=0)', async () => {
+    it('falla si StockService.decreaseMany lanza por carrera concurrente', async () => {
       prismaMock.product.findMany.mockResolvedValue([{ id: 1, price: 10.0, stock: 5 }]);
-      // Concurrent tx already consumed the stock between our read and the update
-      prismaMock.product.updateMany.mockResolvedValue({ count: 0 });
+      // Concurrent tx consumed the stock between our findMany and decreaseMany
+      stockServiceMock.decreaseMany.mockRejectedValue(
+        new ConflictException('Insufficient stock for product 1 (concurrent update)'),
+      );
 
       await expect(
         service.create({ items: [{ productId: 1, quantity: 3 }] }, 1),
       ).rejects.toThrow(ConflictException);
     });
 
-    it('decrementa el stock de cada producto al crear la orden', async () => {
+    it('delega el decremento de stock a StockService.decreaseMany con los items correctos', async () => {
       prismaMock.product.findMany.mockResolvedValue(mockProducts);
       prismaMock.order.create.mockResolvedValue(makeOrder());
 
@@ -254,15 +264,10 @@ describe('OrdersService', () => {
         1,
       );
 
-      expect(prismaMock.product.updateMany).toHaveBeenCalledTimes(2);
-      expect(prismaMock.product.updateMany).toHaveBeenCalledWith({
-        where: { id: 1, stock: { gte: 2 } },
-        data: { stock: { decrement: 2 } },
-      });
-      expect(prismaMock.product.updateMany).toHaveBeenCalledWith({
-        where: { id: 2, stock: { gte: 1 } },
-        data: { stock: { decrement: 1 } },
-      });
+      expect(stockServiceMock.decreaseMany).toHaveBeenCalledWith(
+        [{ productId: 1, quantity: 2 }, { productId: 2, quantity: 1 }],
+        prismaMock, // tx recibido de $transaction
+      );
     });
 
     // ── validación de existencia ─────────────────────────────────────────────
@@ -282,7 +287,7 @@ describe('OrdersService', () => {
         service.create({ items: [{ productId: 999, quantity: 1 }] }, 1),
       ).rejects.toThrow();
 
-      expect(prismaMock.product.updateMany).not.toHaveBeenCalled();
+      expect(stockServiceMock.decreaseMany).not.toHaveBeenCalled();
       expect(prismaMock.order.create).not.toHaveBeenCalled();
     });
 
@@ -295,6 +300,66 @@ describe('OrdersService', () => {
           1,
         ),
       ).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  // ── persist ───────────────────────────────────────────────────────────────
+
+  describe('persist', () => {
+    const persistItems = [
+      { productId: 1, quantity: 2, price: 100.0 },
+      { productId: 2, quantity: 1, price: 50.0 },
+    ];
+
+    it('orders pueden crearse sin checkout: persist llama tx.order.create directamente', async () => {
+      const txMock = { order: { create: jest.fn().mockResolvedValue(makeOrder({ total: 250.0 })) } } as any;
+
+      await service.persist(txMock, 7, persistItems, 250.0);
+
+      expect(txMock.order.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            userId: 7,
+            total: 250.0,
+            items: { create: persistItems },
+          }),
+        }),
+      );
+    });
+
+    it('persist sin couponId no incluye couponId en el data', async () => {
+      const txMock = { order: { create: jest.fn().mockResolvedValue(makeOrder()) } } as any;
+
+      await service.persist(txMock, 1, persistItems, 150.0);
+
+      const { data } = txMock.order.create.mock.calls[0][0];
+      expect(data.couponId).toBeUndefined();
+    });
+
+    it('persist con couponId incluye couponId en el data', async () => {
+      const txMock = { order: { create: jest.fn().mockResolvedValue(makeOrder()) } } as any;
+
+      await service.persist(txMock, 1, persistItems, 120.0, 5);
+
+      const { data } = txMock.order.create.mock.calls[0][0];
+      expect(data.couponId).toBe(5);
+    });
+
+    it('persist retorna lo que devuelve tx.order.create', async () => {
+      const expected = makeOrder({ total: 100 });
+      const txMock = { order: { create: jest.fn().mockResolvedValue(expected) } } as any;
+
+      const result = await service.persist(txMock, 1, persistItems, 100.0);
+
+      expect(result).toEqual(expected);
+    });
+
+    it('persist no valida stock ni llama a StockService (esa responsabilidad es del caller)', async () => {
+      const txMock = { order: { create: jest.fn().mockResolvedValue(makeOrder()) } } as any;
+
+      await service.persist(txMock, 1, persistItems, 150.0);
+
+      expect(stockServiceMock.decreaseMany).not.toHaveBeenCalled();
     });
   });
 
@@ -424,7 +489,7 @@ describe('OrdersService', () => {
       ['cancelled', OrderStatus.Pending,   'estado terminal'],
     ] as const)(
       "transición inválida '%s' → '%s' lanza UnprocessableEntityException (%s)",
-      async (from, to) => {
+      async (from, to, _label) => {
         prismaMock.order.findUnique.mockResolvedValue(makeOrder({ status: from }));
 
         await expect(
@@ -461,6 +526,29 @@ describe('OrdersService', () => {
       await expect(
         service.updateStatus(1, { status: OrderStatus.Pending }),
       ).rejects.toThrow(UnprocessableEntityException);
+    });
+
+    // ── no hay lógica de estado fuera de state machine ──────────────────────
+
+    it('delega la validación de transición a OrderStateMachine.transition', async () => {
+      const spy = jest.spyOn(OrderStateMachine, 'transition');
+      prismaMock.order.findUnique.mockResolvedValue(makeOrder({ status: 'pending' }));
+      prismaMock.order.update.mockResolvedValue(makeOrder({ status: 'paid' }));
+
+      await service.updateStatus(1, { status: OrderStatus.Paid });
+
+      expect(spy).toHaveBeenCalledWith(OrderStatus.Pending, OrderStatus.Paid);
+      spy.mockRestore();
+    });
+
+    it('transición inválida lanzada por OrderStateMachine se propaga al caller', async () => {
+      prismaMock.order.findUnique.mockResolvedValue(makeOrder({ status: 'delivered' }));
+
+      await expect(
+        service.updateStatus(1, { status: OrderStatus.Pending }),
+      ).rejects.toThrow(UnprocessableEntityException);
+
+      expect(prismaMock.order.update).not.toHaveBeenCalled();
     });
 
     // ── orden inexistente ────────────────────────────────────────────────────

@@ -3,6 +3,7 @@ import { ConflictException } from '@nestjs/common';
 import * as bcrypt from 'bcrypt';
 import { UsersService } from './users.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { Role } from '../auth/enums/role.enum';
 
 const prismaMock = {
   user: {
@@ -39,6 +40,7 @@ describe('UsersService', () => {
         email: dto.email,
         name: dto.name,
         password: '$2b$10$hashedvalue',
+        role: Role.User,
         createdAt: new Date(),
       });
 
@@ -58,6 +60,7 @@ describe('UsersService', () => {
           email: data.email,
           name: data.name,
           password: data.password,
+          role: Role.User,
           createdAt: new Date(),
         });
       });

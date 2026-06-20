@@ -1,11 +1,9 @@
-import { IsInt, IsPositive, Min } from 'class-validator';
+import { PositiveInt } from '../../common/dto/numeric-field.decorators';
 
 export class AddToCartDto {
-  @IsInt()
-  @IsPositive()
+  @PositiveInt('productId')
   productId: number;
 
-  @IsInt()
-  @Min(1)
+  @PositiveInt('quantity')
   quantity: number;
 }
