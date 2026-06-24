@@ -20,9 +20,9 @@ export class GetProductsDto {
   @IsOptional()
   categoryId?: number;
 
-  @IsIn(['price', 'stock'])
+  @IsIn(['name', 'price', 'stock', 'createdAt'])
   @IsOptional()
-  sortBy?: 'price' | 'stock';
+  sortBy?: 'name' | 'price' | 'stock' | 'createdAt';
 
   @IsIn(['asc', 'desc'])
   @IsOptional()
